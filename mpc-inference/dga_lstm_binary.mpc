@@ -1,0 +1,205 @@
+from Compiler import ml
+from Compiler import mpc_math
+import math
+
+#sfix.set_precision(8, 16)
+#print_float_precision(16)
+
+class Embedding:
+    def __init__(self, output_dim, weights, X):
+        self.weights=weights
+        self.output_dim = output_dim
+        self.Y = self.get(X)
+
+    def get(self, X):
+        vector_lenght = X.sizes[1]
+        Y = sfix.Matrix(vector_lenght, self.output_dim)
+        Y = X*self.weights
+        return Y
+
+class LSTM_MPC:
+    def __init__(self, units, isBinary):
+        self.units=units
+        self.isBinary=isBinary
+
+    def tanh_matrix_mpc(self, x):
+        len_column = x.sizes[1]
+        len_row = x.sizes[0]
+        
+        for i in range(len_row):
+            x[i].assign_vector( mpc_math.tanh( x[i].get_vector(0, len_column) ) )
+        return x
+
+    def softmax_2D_MPC(self, X):
+        max = X[0][0]
+        for i in range(X.sizes[1]):
+            max = (max > X[0][i]).if_else(max, X[0][i])
+        
+        e_mpc = sfix.Matrix(1, X.sizes[1])
+        
+        sum_e = sint(0)
+        for i in range(X.sizes[1]):
+            e_mpc[0][i] = mpc_math.pow_fx(math.e, (X[0][i] - max))
+            sum_e = sum_e + e_mpc[0][i]        
+        dist = sfix.Matrix(1, X.sizes[1])
+        for i in range(X.sizes[1]):
+            dist[0][i] = e_mpc[0][i] / sum_e
+        return dist
+
+    def sigmoid_matrix_mpc(self, x):
+        len_column = x.sizes[1]
+        len_row = x.sizes[0]
+        
+        for i in range(len_row):        
+            x[i].assign_vector( ml.sigmoid( x[i].get_vector(0, len_column) ) )
+        return x
+
+    def dense(self, X, W, b):
+        output = X.__mul__(W) + b
+        return output
+    
+    def get_columns_array(self, array_mpc, rows, start_column, end_column):
+        sm = sfix.Matrix(array_mpc.sizes[0], end_column-start_column)
+        for i in range(rows):
+            sm[i].assign_vector(array_mpc[i].get_vector(start_column, end_column-start_column), base=0)
+        return sm
+
+
+    def lstm_layer(self, X, kernel_weights, recurrent_kernel_weights, bias, units, len_, return_sequences=False):
+        # kernels
+        kernel_i = self.get_columns_array(kernel_weights, kernel_weights.sizes[0], 0, units)
+        kernel_f = self.get_columns_array(kernel_weights, kernel_weights.sizes[0], units, units*2)
+        kernel_c = self.get_columns_array(kernel_weights, kernel_weights.sizes[0], units * 2, units * 3)
+        kernel_o = self.get_columns_array(kernel_weights,  kernel_weights.sizes[0], units * 3, kernel_weights.sizes[1])
+
+        # recurrent kernel
+        h_i = self.get_columns_array(recurrent_kernel_weights, recurrent_kernel_weights.sizes[0], 0, units)
+        h_f = self.get_columns_array(recurrent_kernel_weights, recurrent_kernel_weights.sizes[0], units, units*2)
+        h_c = self.get_columns_array(recurrent_kernel_weights, recurrent_kernel_weights.sizes[0], units * 2, units * 3)
+        h_o = self.get_columns_array(recurrent_kernel_weights, recurrent_kernel_weights.sizes[0], units*3, kernel_weights.sizes[1])
+
+        # bias
+        bias_i = self.get_columns_array(bias, 1, 0, units)
+        bias_f = self.get_columns_array(bias, 1, units, units*2)
+        bias_c = self.get_columns_array(bias, 1, units*2, units*3)
+        bias_o = self.get_columns_array(bias, 1, units*3, bias.sizes[1])
+
+        ht_1 =  sfix.Matrix(1, units)
+        Ct_1 =  sfix.Matrix(1, units)
+
+        output = sfix.Matrix(1, units)
+        
+        if return_sequences:
+            output = sfix.Matrix(len_, units)
+
+        x_aux = sfix.Matrix(1, X.sizes[1])
+
+        @for_range_opt(len_)
+        def _(t):
+          x_aux[0] = X[t].get_vector()
+          ft = self.sigmoid_matrix_mpc( x_aux.__mul__(kernel_f) + ht_1.__mul__(h_f) + bias_f )  # forget gate          
+          it = self.sigmoid_matrix_mpc( x_aux.__mul__(kernel_i) + ht_1.__mul__(h_i) + bias_i )  # input gate
+          ot = self.sigmoid_matrix_mpc( x_aux.__mul__(kernel_o) + ht_1.__mul__(h_o) + bias_o )   # output gate          
+          ct = ft[0].__mul__(Ct_1[0]) + it[0].__mul__(self.tanh_matrix_mpc(x_aux.__mul__(kernel_c) + ht_1.__mul__(h_c) + bias_c)[0])
+          ct_matrix = sfix.Matrix(1, len(ct))
+          ct_matrix[0] = ct
+          ht = ot[0].get_vector() * self.tanh_matrix_mpc(ct_matrix)[0]          
+
+          ht_1[0] = ht  # hidden state, previous memory state
+          Ct_1[0] = ct  # cell state, previous carry state
+
+          if return_sequences:
+            output[t] = ht
+          else:
+            output[0] = ht
+
+        return output
+
+    def predict(self, X, units, W, b, weights):
+        i=0
+        bias = weights[i][2]
+        X_mpc = X
+        kernel_weights = weights[i][0]
+        recurrent_kernel_weights = weights[i][1]
+        bias_mpc = bias
+        h = self.lstm_layer(X_mpc, kernel_weights, recurrent_kernel_weights, bias, units, 64, True)
+        X_mpc = h
+
+        i=1
+        bias = weights[i][2]
+        kernel_weights = weights[i][0]
+        recurrent_kernel_weights = weights[i][1]
+        bias_mpc = bias
+        h = self.lstm_layer(X_mpc, kernel_weights, recurrent_kernel_weights, bias, units, 64, False)
+        X_mpc = h
+
+        W_mpc = W
+        b_mpc = b
+
+        h = self.dense(X_mpc, W_mpc, b_mpc)
+        
+        if self.isBinary:
+            h1 = self.sigmoid_matrix_mpc( h )
+            res=sfix(h1[0][0]>0.5)
+            return res
+        else:
+            h1 = self.softmax_2D_MPC( h )
+            res=sfix(ml.argmax(h1[0]))
+            return res
+
+units     = 32
+embedding_dim=128
+input_shape=64
+
+kernel_weights0 = sfix.Matrix(embedding_dim, embedding_dim)
+recurrent_kernel_weights0 = sfix.Matrix(units, embedding_dim)
+bias0 = sfix.Matrix(1, embedding_dim)
+kernel_weights1 = sfix.Matrix(units, embedding_dim)
+recurrent_kernel_weights1 = sfix.Matrix(units, embedding_dim)
+bias1 = sfix.Matrix(1, embedding_dim)
+embedding_weights = sfix.Matrix(embedding_dim, embedding_dim)
+dense_w = sfix.Matrix(units, 1)
+dense_b  = sfix.Matrix(1, 1)
+
+test_X = sfix.Matrix(input_shape, embedding_dim)
+
+test_y = sfix.Matrix(1,1)
+
+embedding_weights.input_from(0)
+kernel_weights0.input_from(0)
+recurrent_kernel_weights0.input_from(0)
+bias0.input_from(0)
+kernel_weights1.input_from(0)
+recurrent_kernel_weights1.input_from(0)
+bias1.input_from(0)
+dense_w.input_from(0)
+dense_b.input_from(0)
+
+weights_lstm = []
+weight = []
+weight.append(kernel_weights0)
+weight.append(recurrent_kernel_weights0)
+weight.append(bias0)
+weights_lstm.append(weight)
+weight = []
+weight.append(kernel_weights1)
+weight.append(recurrent_kernel_weights1)
+weight.append(bias1)
+weights_lstm.append(weight)
+
+total=1
+acc = sfix.Matrix(1, total)
+
+@for_range_opt(total)
+def _(i):
+    test_X.input_from(1)
+    test_y.input_from(1)
+    start_timer(1000)
+    embedding = Embedding(embedding_dim, embedding_weights, test_X)
+    model = LSTM_MPC(units=units, isBinary=True)
+    predict = model.predict(embedding.Y, units, dense_w, dense_b, weights_lstm) 
+    stop_timer(1000)
+    real=sfix(test_y[0][0])
+    eval=predict.__eq__(real)
+    acc[0][i] = sfix(eval)
+    print_ln('predict: %s real:%s', predict.reveal(), real.reveal())

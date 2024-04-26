@@ -1,0 +1,157 @@
+from Compiler import ml
+from Compiler import util
+
+#sfix.set_precision(8, 16)
+#print_float_precision(16)
+
+class Embedding:
+    def __init__(self, output_dim, weights, X):
+        self.weights=weights
+        self.output_dim = output_dim
+        self.Y = self.get(X)
+
+    def get(self, X):
+        vector_lenght = X.sizes[1]
+        Y = sfix.Matrix(vector_lenght, self.output_dim)
+        Y = X*self.weights
+        return Y
+
+class Conv1d:
+    def __init__(self, filters, kernel_size, activation, input_shape, weights, bias, X):
+        self.filters=filters
+        self.kernel_size=kernel_size
+        self.activation=activation
+        self.input_shape=input_shape
+        self.weights=weights
+        self.bias=bias
+        self.Y = self.convolution(X)
+
+    def convolution(self, X):
+        if X.sizes[0]>1:
+            return self.convolution_input2D(X) # input is Embedding Layer
+        else:
+            return self.convolution_input1D(X) # input without Embedding Layer
+
+    def convolution_input1D(self, X):
+        len_ = self.input_shape-self.kernel_size+1
+        Y = sfix.Matrix(self.filters, len_)
+
+        @for_range_opt([filters, len_])
+        def _(k, i):
+            X_slice = X[0].get_part(i, self.kernel_size)
+            Y[k][i] = ml.relu(sum(X_slice.__mul__(self.weights[k])) + self.bias[0][k])
+        return Y
+
+    def convolution_input2D(self, X): # CNN1D
+        output_size_cnn=self.input_shape-self.kernel_size+1
+        embedding_dim=128
+        
+        X1 = sfix.Matrix(1, embedding_dim) # each character
+        
+        Y1 = sfix.Matrix(output_size_cnn, self.filters)
+        
+        for i in range(self.kernel_size):
+            W1 = sfix.Matrix(embedding_dim, self.filters)            
+            for j1 in range(embedding_dim):
+                W1[j1] = self.weights[i].get_part(j1*self.filters, self.filters)
+
+            for j in range(output_size_cnn):
+                X1[0] = X[i+j].get_vector()
+                Y1_ = X1 * W1
+
+                for k in range(self.filters):
+                    Y1[j][k] = Y1[j][k] + Y1_[0][k]
+
+        @for_range_opt([self.filters, output_size_cnn])
+        def _(k, i):
+            Y1[i][k] = ml.relu(Y1[i][k] + self.bias[0][k])
+
+        return Y1
+
+class Flatten:
+    def __init__(self, X):
+        self.Y = self.flatten(X)
+
+    def flatten(self, X):
+        len_ = X.sizes[0] * X.sizes[1]
+        Y = sfix.Matrix(1, len_)
+
+        @for_range_opt(X.sizes[0])
+        def _(i):
+            Y[0].assign(X[i].get_vector(), base=i*X.sizes[1])
+
+        return Y
+
+class MaxPooling1D:
+    def __init__(self, filters, pool_size, input_shape, X):
+        self.filters=filters
+        self.pool_size=pool_size
+        self.input_shape=input_shape
+        self.Y=self.maxPooling1D(X)
+
+    def maxPooling1D(self, X):
+        len_ = (self.input_shape-self.pool_size+1) // self.pool_size
+        Y = sfix.Matrix(len_, self.filters)
+
+        aux = sfix.Matrix(1, self.pool_size)
+
+        for i in range(len_):
+            for j in range(self.filters):
+                for k in range(self.pool_size):
+                    ind=i*self.pool_size+k
+                    aux[0][k] = X[ind][j]
+                Y[i][j] = util.max(aux[0].get_vector())
+
+        return Y
+
+filters=32
+kernel_size=2
+activation='relu'
+input_shape=64
+embedding_dim=128
+pool_size=10
+neurons=100
+
+embedding_weights = sfix.Matrix(embedding_dim, embedding_dim)
+cnn_weights = sfix.Matrix(kernel_size, embedding_dim*filters)
+cnn_bias = sfix.Matrix(1, filters)
+
+embedding_weights.input_from(0)
+cnn_weights.input_from(0)
+cnn_bias.input_from(0)
+
+test_X = sfix.Matrix(input_shape, embedding_dim)
+test_y = sfix.Matrix(1, 1)
+
+layers=[
+            ml.Dense(1, filters*(input_shape-kernel_size+1), neurons, activation='relu'),
+            ml.Dense(1, neurons, 1), 
+            ml.Output(1)
+        ]
+layers[0].W.input_from(0) # weight layer 0
+layers[0].b.input_from(0) # bias
+layers[1].W.input_from(0) # weight layer 1
+layers[1].b.input_from(0) # bias
+graph = ml.Optimizer()
+graph.layers = layers
+
+total=1
+results = sfix.Tensor((1,total))
+
+@for_range_opt(total)
+def _(i):
+    test_X.input_from(1)
+    test_y.input_from(1)
+    
+    start_timer(1000)
+    embedding = Embedding(embedding_dim, embedding_weights, test_X)
+    conv1d = Conv1d(filters, kernel_size, activation, input_shape, cnn_weights, cnn_bias, embedding.Y)
+#    maxPooling1D = MaxPooling1D(filters, pool_size, input_shape, conv1d.Y)
+#    flatten = Flatten(maxPooling1D.Y)
+    flatten = Flatten(conv1d.Y)
+    predict = sfix( graph.eval(flatten.Y)[0] >= 0.5 )
+    stop_timer(1000)
+    real=sfix(test_y[0][0])
+    eval=predict.__eq__(real)
+    results[0][i] = eval
+    print_ln('predict: %s real:%s', predict.reveal(), real.reveal())
