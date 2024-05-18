@@ -3,3 +3,7 @@
 The codes for training with DP-SGD are in the [dp-training](dp-training) folder.
 
 The MPC protocols for DGA inference are in the [mpc-inference](mpc-inference) folder.
+
+## Author
+
+- **Ricardo J. M. Maia** - [ricardojmmaia](https://github.com/ricardojmmaia)
